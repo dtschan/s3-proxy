@@ -13,6 +13,10 @@ Or if you prefer a DeploymentConfig instead of a Deployment
 oc new-app  https://github.com/puzzle/s3-proxy --as-deployment-config
 ```
 
+## Prerequisites
+
+Only the `curl` tool is needed to use this proxy.
+
 ## Usage
 
 ```sh
