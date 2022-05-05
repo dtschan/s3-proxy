@@ -4,12 +4,13 @@ use std::process::exit;
 
 use chrono::Utc;
 use hmacsha1::hmac_sha1;
+use hyper::header::HeaderValue;
 use hyper::service::{make_service_fn, service_fn};
-use hyper::{Body, Request, Response, Server, Client, StatusCode};
+use hyper::{Body, Request, Response, Server, Client, StatusCode, body};
 use hyper_tls::HttpsConnector;
 use signal_hook_tokio::Signals;
 use signal_hook::consts::signal::*;
-use futures::stream::StreamExt;
+use futures::stream::{StreamExt, self};
 
 // type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 
@@ -79,11 +80,32 @@ async fn proxy_handler(mut request: Request<Body>) -> Result<Response<Body>, Box
 
 async fn proxy_handler_wrapper(request: Request<Body>) -> Result<Response<Body>, Infallible> {
   match proxy_handler(request).await {
-    Ok(value) => Ok(value),
-    Err(value) => {
-        println!("{}", value);
-        let status: StatusCode = value.to_string()[0..3].parse().unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-        Ok(Response::builder().status(status).body(Body::from(value.to_string() + "\n")).unwrap())
+    Ok(mut response) => {
+        if response.status().is_client_error() || response.status().is_server_error() {
+            let prefix = "Upstream: ";
+            let suffix = "\r\n";
+            let (parts, body) = response.into_parts();
+            let stream = Body::from(prefix).chain(body).chain(Body::from(suffix));
+            response = Response::from_parts(parts, Body::wrap_stream(stream));
+
+            // Update Content-Length header to factor in added prefix and suffix
+            if let Some(length) = response.headers().get("Content-Length") {
+                let mut length = length.to_str().unwrap_or("").parse::<usize>().unwrap_or(0);
+                if length > 0 {
+                    length += prefix.len() + suffix.len();
+                    response.headers_mut().insert("Content-Length", HeaderValue::from(length));
+                }
+            }
+            //let length = response
+            //response.headers_mut().header("Content-Length", res
+        }
+
+        Ok(response)
+    }
+    Err(error) => {
+        println!("Error: {}", error);
+        let status: StatusCode = error.to_string()[0..3].parse().unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        Ok(Response::builder().status(status).body(Body::from(format!("S3-Proxy: {}\n", error))).unwrap())
     }
   }
 }
