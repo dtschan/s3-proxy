@@ -6,9 +6,9 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+async-compression = { version = "0.4.17", features = ["gzip", "tokio"] }
 base64 = "0"
 chrono = "0"
-flate2 = "1.0.34"
 futures = "0.3.21"
 hmac-sha1 = "0"
 http-body-util = "0.1.2"
@@ -16,6 +16,10 @@ hyper = { version = "1", features = ["full"] }
 hyper-tls = "0"
 hyper-util = { version = "0.1.10", features = ["client", "client-legacy", "http1"] }
 tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7.12", features = ["io"] }
+tracing = { version = "0.1.40", features = ["log"] }
+tracing-logfmt = "0.3.5"
+tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 
 [profile.release]
 lto = true
