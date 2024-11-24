@@ -1,6 +1,7 @@
 use std::error::Error;
 use std::io;
 use std::net::SocketAddr;
+use std::backtrace::Backtrace;
 
 use async_compression::tokio::bufread::GzipEncoder;
 use base64::prelude::*;
@@ -11,13 +12,15 @@ use hmac_sha1::hmac_sha1;
 use http_body_util::{combinators::BoxBody, BodyExt, BodyStream, Full, StreamBody};
 use hyper::{
     body::{Bytes, Frame, Incoming},
+    header::InvalidHeaderValue,
+    http::uri::InvalidUri,
     server::conn::http1,
     service::service_fn,
     Request, Response, StatusCode,
 };
 use hyper_tls::HttpsConnector;
 use hyper_util::{
-    client::legacy::Client,
+    client::legacy::{Client, Error as HyperUtilError},
     rt::{TokioExecutor, TokioIo, TokioTimer},
 };
 use tokio::net::TcpListener;
@@ -25,6 +28,97 @@ use tokio_util::io::{ReaderStream, StreamReader};
 use tracing::{error, info, Span};
 use tracing_logfmt;
 use tracing_subscriber::{layer::SubscriberExt, EnvFilter, Registry};
+use tracing_subscriber::util::SubscriberInitExt;
+
+#[derive(Debug)]
+pub struct ProxyError {
+    inner: Box<dyn Error + Send + Sync>,
+    backtrace: Backtrace,
+}
+
+impl ProxyError {
+    fn new<E>(error: E) -> Self
+    where
+        E: Into<Box<dyn Error + Send + Sync>>,
+    {
+        Self {
+            inner: error.into(),
+            backtrace: Backtrace::capture(),
+        }
+    }
+}
+
+impl std::fmt::Display for ProxyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.inner)
+    }
+}
+
+impl Error for ProxyError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        self.inner.source()
+    }
+}
+
+impl From<&str> for ProxyError {
+    fn from(s: &str) -> Self {
+        ProxyError::new(s.to_string())
+    }
+}
+
+impl From<String> for ProxyError {
+    fn from(s: String) -> Self {
+        ProxyError::new(s)
+    }
+}
+
+impl From<hyper::Error> for ProxyError {
+    fn from(err: hyper::Error) -> Self {
+        ProxyError::new(err)
+    }
+}
+
+impl From<hyper::http::Error> for ProxyError {
+    fn from(err: hyper::http::Error) -> Self {
+        ProxyError::new(err)
+    }
+}
+
+impl From<InvalidHeaderValue> for ProxyError {
+    fn from(err: InvalidHeaderValue) -> Self {
+        ProxyError::new(err)
+    }
+}
+
+impl From<InvalidUri> for ProxyError {
+    fn from(err: InvalidUri) -> Self {
+        ProxyError::new(err)
+    }
+}
+
+impl From<HyperUtilError> for ProxyError {
+    fn from(err: HyperUtilError) -> Self {
+        ProxyError::new(err)
+    }
+}
+
+impl From<io::Error> for ProxyError {
+    fn from(err: io::Error) -> Self {
+        ProxyError::new(err)
+    }
+}
+
+impl From<Box<dyn Error + Send + Sync>> for ProxyError {
+    fn from(err: Box<dyn Error + Send + Sync>) -> Self {
+        ProxyError::new(err)
+    }
+}
+
+impl From<tracing_subscriber::util::TryInitError> for ProxyError {
+    fn from(err: tracing_subscriber::util::TryInitError) -> Self {
+        ProxyError::new(err)
+    }
+}
 
 fn full<T: Into<Bytes>>(chunk: T) -> BoxBody<Bytes, hyper::Error> {
     Full::new(chunk.into())
@@ -34,45 +128,45 @@ fn full<T: Into<Bytes>>(chunk: T) -> BoxBody<Bytes, hyper::Error> {
 
 async fn proxy_handler(
     mut request: Request<Incoming>,
-) -> Result<Response<Incoming>, Box<dyn Error>> {
+) -> Result<Response<Incoming>, ProxyError> {
     let s3_host = request
         .headers_mut()
         .remove("S3-Host")
-        .ok_or("400 Missing required header 'S3-Host'!")?
+        .ok_or_else(|| ProxyError::new("400 Missing required header 'S3-Host'!"))?
         .to_str()
-        .map_err(|_| "400 Invalid characters in header 'S3-Host'!")?
+        .map_err(|_| ProxyError::new("400 Invalid characters in header 'S3-Host'!"))?
         .to_owned();
     let access_key = request
         .headers_mut()
         .remove("Access-Key")
-        .ok_or("400 Missing required header 'Access-Key'!")?
+        .ok_or_else(|| ProxyError::new("400 Missing required header 'Access-Key'!"))?
         .to_str()
-        .map_err(|_| "400 Invalid characters in header 'Access-Key'!")?
+        .map_err(|_| ProxyError::new("400 Invalid characters in header 'Access-Key'!"))?
         .to_owned();
     let secret_key = request
         .headers_mut()
         .remove("Secret-Key")
-        .ok_or("400 Missing required header 'Secret-Key'!")?
+        .ok_or_else(|| ProxyError::new("400 Missing required header 'Secret-Key'!"))?
         .to_str()
-        .map_err(|_| "400 Invalid characters in header 'Secret-Key'!")?
+        .map_err(|_| ProxyError::new("400 Invalid characters in header 'Secret-Key'!"))?
         .to_owned();
     let compress_file = request
         .headers_mut()
         .remove("Compress-File")
-        .unwrap_or("".parse()?)
+        .unwrap_or_else(|| "".parse().unwrap())
         .to_str()
-        .map_err(|_| "400 Invalid characters in header 'Compress-File'!")?
+        .map_err(|_| ProxyError::new("400 Invalid characters in header 'Compress-File'!"))?
         .to_owned();
     let content_type = request
         .headers_mut()
         .entry("content-type")
-        .or_insert("application/octet_stream".parse()?)
+        .or_insert_with(|| "application/octet_stream".parse().unwrap())
         .to_str()
-        .map_err(|_| "400 Invalid characters in header 'Content-Type'!")?
+        .map_err(|_| ProxyError::new("400 Invalid characters in header 'Content-Type'!"))?
         .to_owned();
 
     request.headers_mut().insert("host", s3_host.parse()?);
-
+    
     let date = Utc::now().format("%a, %d %b %Y %T %z").to_string();
     request.headers_mut().insert("Date", date.parse()?);
 
@@ -110,13 +204,13 @@ async fn proxy_handler(
         let body = StreamBody::new(stream);
         let request = Request::from_parts(parts, body);
         let client = Client::builder(TokioExecutor::new()).build(https);
-        client.request(request).await
+        client.request(request).await?
     } else {
         let client = Client::builder(TokioExecutor::new()).build(https);
-        client.request(request).await
+        client.request(request).await?
     };
 
-    Ok(response?)
+    Ok(response)
 }
 
 fn client_ip(request: &Request<Incoming>, addr: Option<SocketAddr>) -> String {
@@ -130,19 +224,6 @@ fn client_ip(request: &Request<Incoming>, addr: Option<SocketAddr>) -> String {
                 .unwrap_or_else(|| "-".to_string())
         })
 }
-
-/* fn log_request(client_ip: &str,  ) -> Span {
-    let remote_addr = client_ip(request, addr);
-
-    info_span!(
-        "",
-        remote_addr = remote_addr,
-        method = request.method().to_string(),
-        path = request.uri().path(),
-        status = field::Empty,
-        size = field::Empty
-    )
-} */
 
 fn log_response<B>(client_ip: &str, method: &str, path: &str, response: &Response<B>) {
     let span = Span::current();
@@ -191,10 +272,13 @@ async fn proxy_handler_wrapper(
                 log_response(&client_ip, &method, &path, &response);
                 Ok(response)
             }
-            //let length = response
-            //response.headers_mut().header("Content-Length", res
         }
         Err(error) => {
+            error!(
+                error = %error,
+                backtrace = ?error.backtrace,
+                "Proxy error occurred"
+            );
             let status: StatusCode = error.to_string()[0..3]
                 .parse()
                 .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
@@ -209,16 +293,16 @@ async fn proxy_handler_wrapper(
 }
 
 #[tokio::main]
-pub async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+pub async fn main() -> Result<(), ProxyError> {
     // Initialize logging with logfmt format and env-filter
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
-    let subscriber = Registry::default()
+    Registry::default()
         .with(env_filter)
         .with(tracing_logfmt::Builder::new()
             .with_target(false)
-            .layer());
-    tracing::subscriber::set_global_default(subscriber)?;
+            .layer())
+        .try_init()?;
 
     let addr: SocketAddr = ([0, 0, 0, 0], 8080).into();
 
@@ -238,7 +322,10 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 )
                 .await
             {
-                error!(error = ?err, "Error serving connection");
+                error!(
+                    error = %err,
+                    "Error serving connection"
+                );
             }
         });
     }

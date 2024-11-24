@@ -4,7 +4,7 @@ WORKDIR /rust
 
 COPY ./ .
 
-RUN cargo build  --release
+RUN cargo build --release
 
 
 

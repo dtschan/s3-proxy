@@ -8,6 +8,7 @@ edition = "2021"
 [dependencies]
 async-compression = { version = "0.4.17", features = ["gzip", "tokio"] }
 base64 = "0"
+backtrace = "0.3"
 chrono = "0"
 futures = "0.3.21"
 hmac-sha1 = "0"
@@ -24,3 +25,5 @@ tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 [profile.release]
 lto = true
 codegen-units = 1
+debug = true
+strip = false
