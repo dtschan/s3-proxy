@@ -4,6 +4,7 @@ use std::net::SocketAddr;
 use std::backtrace::Backtrace;
 
 use async_compression::tokio::bufread::GzipEncoder;
+use async_compression::tokio::bufread::GzipDecoder;
 use base64::prelude::*;
 use chrono::Utc;
 use futures::stream::StreamExt;
@@ -120,7 +121,7 @@ impl From<tracing_subscriber::util::TryInitError> for ProxyError {
     }
 }
 
-fn full<T: Into<Bytes>>(chunk: T) -> BoxBody<Bytes, hyper::Error> {
+fn full<T: Into<Bytes>>(chunk: T) -> BoxBody<Bytes, ProxyError> {
     Full::new(chunk.into())
         .map_err(|never| match never {})
         .boxed()
@@ -128,7 +129,7 @@ fn full<T: Into<Bytes>>(chunk: T) -> BoxBody<Bytes, hyper::Error> {
 
 async fn proxy_handler(
     mut request: Request<Incoming>,
-) -> Result<Response<Incoming>, ProxyError> {
+) -> Result<Response<BoxBody<Bytes, ProxyError>>, ProxyError> {
     let s3_host = request
         .headers_mut()
         .remove("S3-Host")
@@ -156,6 +157,13 @@ async fn proxy_handler(
         .unwrap_or_else(|| "".parse().unwrap())
         .to_str()
         .map_err(|_| ProxyError::new("400 Invalid characters in header 'Compress-File'!"))?
+        .to_owned();
+    let decompress_file = request
+        .headers_mut()
+        .remove("Decompress-File")
+        .unwrap_or_else(|| "".parse().unwrap())
+        .to_str()
+        .map_err(|_| ProxyError::new("400 Invalid characters in header 'Decompress-File'!"))?
         .to_owned();
     let content_type = request
         .headers_mut()
@@ -202,14 +210,34 @@ async fn proxy_handler(
         let encoder = GzipEncoder::new(stream_reader);
         let stream = ReaderStream::new(encoder).map_ok(Frame::data);
         let body = StreamBody::new(stream);
-        let request = Request::from_parts(parts, body);
+        let request = Request::from_parts(parts, BodyExt::boxed(body));
         let client = Client::builder(TokioExecutor::new()).build(https);
-        client.request(request).await?
+        let response = client.request(request).await?;
+        let (parts, body) = response.into_parts();
+        let response = Response::from_parts(parts, BodyExt::boxed(body.map_err(ProxyError::from)));
+        response
+    } else if request.method() == "GET" && decompress_file == "gzip" {
+        let client = Client::builder(TokioExecutor::new()).build(https);
+        let response = client.request(request).await?;
+        let (mut parts, body) = response.into_parts();
+        parts.headers.remove("Content-Length");
+        let stream = body
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+            .into_data_stream();
+        let stream_reader = StreamReader::new(stream);
+        let decoder = GzipDecoder::new(stream_reader);
+        let stream = ReaderStream::new(decoder).map_ok(Frame::data).map_err(ProxyError::from);
+        let body = StreamBody::new(stream);
+        let response = Response::from_parts(parts, BodyExt::boxed(body));
+        response
     } else {
         let client = Client::builder(TokioExecutor::new()).build(https);
-        client.request(request).await?
+        let response = client.request(request).await?;
+        let (parts, body) = response.into_parts();
+        let response = Response::from_parts(parts, BodyExt::boxed(body.map_err(ProxyError::from)));
+        response
     };
-
+        
     Ok(response)
 }
 
@@ -249,7 +277,7 @@ fn log_response<B>(client_ip: &str, method: &str, path: &str, response: &Respons
 async fn proxy_handler_wrapper(
     request: Request<Incoming>,
     addr: SocketAddr,
-) -> Result<Response<BoxBody<Bytes, hyper::Error>>, hyper::Error> {
+) -> Result<Response<BoxBody<Bytes, ProxyError>>, ProxyError> {
     let client_ip = client_ip(&request, Some(addr));
     let method = request.method().to_string();
     let path = request.uri().path().to_string();
@@ -323,7 +351,7 @@ pub async fn main() -> Result<(), ProxyError> {
                 .await
             {
                 error!(
-                    error = %err,
+                    error = ?err,
                     "Error serving connection"
                 );
             }
