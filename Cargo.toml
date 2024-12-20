@@ -8,7 +8,6 @@ edition = "2021"
 [dependencies]
 async-compression = { version = "0.4.17", features = ["gzip", "tokio"] }
 base64 = "0"
-backtrace = "0.3"
 chrono = "0"
 futures = "0.3.21"
 hmac-sha1 = "0"
@@ -16,11 +15,16 @@ http-body-util = "0.1.2"
 hyper = { version = "1", features = ["full"] }
 hyper-tls = "0"
 hyper-util = { version = "0.1.10", features = ["client", "client-legacy", "http1"] }
+thiserror = "2"
+trust-dns-resolver = "0.23"
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7.12", features = ["io"] }
 tracing = { version = "0.1.40", features = ["log"] }
 tracing-logfmt = "0.3.5"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
+prometheus_exporter = "0.8.5"
+dns-lookup = "2.0.4"
+lazy_static = "1.4.0"
 
 [profile.release]
 lto = true

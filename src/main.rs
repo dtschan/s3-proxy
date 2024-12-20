@@ -1,12 +1,13 @@
 use std::error::Error;
 use std::io;
+use std::net::IpAddr;
 use std::net::SocketAddr;
-use std::backtrace::Backtrace;
 
-use async_compression::tokio::bufread::GzipEncoder;
 use async_compression::tokio::bufread::GzipDecoder;
+use async_compression::tokio::bufread::GzipEncoder;
 use base64::prelude::*;
 use chrono::Utc;
+use dns_lookup::lookup_addr;
 use futures::stream::StreamExt;
 use futures::TryStreamExt;
 use hmac_sha1::hmac_sha1;
@@ -24,100 +25,52 @@ use hyper_util::{
     client::legacy::{Client, Error as HyperUtilError},
     rt::{TokioExecutor, TokioIo, TokioTimer},
 };
+use lazy_static::lazy_static;
+use prometheus_exporter::prometheus::register_int_counter_vec;
+use prometheus_exporter::prometheus::IntCounterVec;
 use tokio::net::TcpListener;
 use tokio_util::io::{ReaderStream, StreamReader};
-use tracing::{error, info, Span};
+use tracing::{error, info};
 use tracing_logfmt;
-use tracing_subscriber::{layer::SubscriberExt, EnvFilter, Registry};
 use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::Registry;
+use tracing_subscriber::{layer::SubscriberExt, EnvFilter};
 
-#[derive(Debug)]
-pub struct ProxyError {
-    inner: Box<dyn Error + Send + Sync>,
-    backtrace: Backtrace,
+use thiserror::Error;
+
+#[derive(Error, Debug)]
+pub enum ProxyError {
+    #[error("Hyper error: {0}")]
+    HyperError(#[from] hyper::Error),
+
+    #[error("HTTP error: {0}")]
+    HttpError(#[from] hyper::http::Error),
+
+    #[error("Invalid header value: {0}")]
+    InvalidHeaderValueError(#[from] InvalidHeaderValue),
+
+    #[error("Invalid URI: {0}")]
+    InvalidUriError(#[from] InvalidUri),
+
+    #[error("Hyper util error: {0}")]
+    HyperUtilError(#[from] HyperUtilError),
+
+    #[error("IO error: {0}")]
+    IoError(#[from] io::Error),
+
+    #[error("Tracing subscriber initialization error: {0}")]
+    TracingInitError(#[from] tracing_subscriber::util::TryInitError),
+
+    #[error("Generic error: {0}")]
+    GenericError(String),
+
+    #[error("Boxed error: {0}")]
+    BoxedError(#[from] Box<dyn Error + Send + Sync>),
 }
 
 impl ProxyError {
-    fn new<E>(error: E) -> Self
-    where
-        E: Into<Box<dyn Error + Send + Sync>>,
-    {
-        Self {
-            inner: error.into(),
-            backtrace: Backtrace::capture(),
-        }
-    }
-}
-
-impl std::fmt::Display for ProxyError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.inner)
-    }
-}
-
-impl Error for ProxyError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        self.inner.source()
-    }
-}
-
-impl From<&str> for ProxyError {
-    fn from(s: &str) -> Self {
-        ProxyError::new(s.to_string())
-    }
-}
-
-impl From<String> for ProxyError {
-    fn from(s: String) -> Self {
-        ProxyError::new(s)
-    }
-}
-
-impl From<hyper::Error> for ProxyError {
-    fn from(err: hyper::Error) -> Self {
-        ProxyError::new(err)
-    }
-}
-
-impl From<hyper::http::Error> for ProxyError {
-    fn from(err: hyper::http::Error) -> Self {
-        ProxyError::new(err)
-    }
-}
-
-impl From<InvalidHeaderValue> for ProxyError {
-    fn from(err: InvalidHeaderValue) -> Self {
-        ProxyError::new(err)
-    }
-}
-
-impl From<InvalidUri> for ProxyError {
-    fn from(err: InvalidUri) -> Self {
-        ProxyError::new(err)
-    }
-}
-
-impl From<HyperUtilError> for ProxyError {
-    fn from(err: HyperUtilError) -> Self {
-        ProxyError::new(err)
-    }
-}
-
-impl From<io::Error> for ProxyError {
-    fn from(err: io::Error) -> Self {
-        ProxyError::new(err)
-    }
-}
-
-impl From<Box<dyn Error + Send + Sync>> for ProxyError {
-    fn from(err: Box<dyn Error + Send + Sync>) -> Self {
-        ProxyError::new(err)
-    }
-}
-
-impl From<tracing_subscriber::util::TryInitError> for ProxyError {
-    fn from(err: tracing_subscriber::util::TryInitError) -> Self {
-        ProxyError::new(err)
+    pub fn new<S: Into<String>>(message: S) -> Self {
+        ProxyError::GenericError(message.into())
     }
 }
 
@@ -174,7 +127,7 @@ async fn proxy_handler(
         .to_owned();
 
     request.headers_mut().insert("host", s3_host.parse()?);
-    
+
     let date = Utc::now().format("%a, %d %b %Y %T %z").to_string();
     request.headers_mut().insert("Date", date.parse()?);
 
@@ -226,7 +179,9 @@ async fn proxy_handler(
             .into_data_stream();
         let stream_reader = StreamReader::new(stream);
         let decoder = GzipDecoder::new(stream_reader);
-        let stream = ReaderStream::new(decoder).map_ok(Frame::data).map_err(ProxyError::from);
+        let stream = ReaderStream::new(decoder)
+            .map_ok(Frame::data)
+            .map_err(ProxyError::from);
         let body = StreamBody::new(stream);
         let response = Response::from_parts(parts, BodyExt::boxed(body));
         response
@@ -237,36 +192,70 @@ async fn proxy_handler(
         let response = Response::from_parts(parts, BodyExt::boxed(body.map_err(ProxyError::from)));
         response
     };
-        
+
     Ok(response)
 }
 
-fn client_ip(request: &Request<Incoming>, addr: Option<SocketAddr>) -> String {
+fn client_ip(request: &Request<Incoming>, addr: SocketAddr) -> IpAddr {
     request
         .headers()
         .get("x-forwarded-for")
         .and_then(|h| h.to_str().ok())
-        .map(String::from)
-        .unwrap_or_else(|| {
-            addr.map(|a| a.ip().to_string())
-                .unwrap_or_else(|| "-".to_string())
-        })
+        .and_then(|h| h.split(',').next())
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or_else(|| addr.ip())
 }
 
-fn log_response<B>(client_ip: &str, method: &str, path: &str, response: &Response<B>) {
-    let span = Span::current();
-    let status = response.status().as_u16();
-    span.record("status", status);
-    
+fn log_response<B>(
+    client_ip: &IpAddr,
+    method: &str,
+    path: &str,
+    reason: &str,
+    response: &Response<B>,
+) {
     let size = response
         .headers()
         .get(hyper::header::CONTENT_LENGTH)
         .and_then(|length| length.to_str().ok())
         .unwrap_or("-");
-    span.record("size", size);
-    
+    let status = response.status().as_u16();
+
+    let (service, namespace) = match lookup_addr(&client_ip) {
+        Ok(name) if name.ends_with("svc.cluster.local") => {
+            info!(client_ip = %client_ip, name = name, "Reverse DNS lookup succedded");
+            let parts: Vec<_> = name.split('.').collect();
+            (
+                parts.get(1).map(|&s| s.to_string()).unwrap_or_default(),
+                parts.get(2).map(|&s| s.to_string()).unwrap_or_default(),
+            )
+        }
+        Ok(name) => {
+            info!(client_ip = %client_ip, name = name, "Reverse DNS lookup doesn't end with svc.cluster.local");
+            (String::new(), String::new())
+        }
+        Err(e) => {
+            error!(client_ip = %client_ip, error = %e, "Reverse DNS lookup failed");
+            (String::new(), String::new())
+        }
+    };
+
+    REQUEST_COUNTER
+        .with_label_values(&[
+            method,
+            &status.to_string(),
+            &service,
+            &namespace,
+            &service,
+            &reason,
+        ])
+        .inc();
+
+    // let span = Span::current();
+    // span.record("status", status);
+    // span.record("size", size);
+
     info!(
-        remote_addr = client_ip,
+        remote_addr = client_ip.to_string(),
         method = method,
         path = path,
         status = status,
@@ -275,12 +264,19 @@ fn log_response<B>(client_ip: &str, method: &str, path: &str, response: &Respons
 }
 
 async fn proxy_handler_wrapper(
-    request: Request<Incoming>,
+    mut request: Request<Incoming>,
     addr: SocketAddr,
 ) -> Result<Response<BoxBody<Bytes, ProxyError>>, ProxyError> {
-    let client_ip = client_ip(&request, Some(addr));
+    let client_ip = client_ip(&request, addr);
     let method = request.method().to_string();
     let path = request.uri().path().to_string();
+    let request_reason = request
+        .headers_mut()
+        .remove("Request-Reason")
+        .unwrap_or_else(|| "".parse().unwrap())
+        .to_str()
+        .map_err(|_| ProxyError::new("400 Invalid characters in header 'Request-Reason'!"))?
+        .to_owned();
     match proxy_handler(request).await {
         Ok(response) => {
             let (mut parts, body) = response.into_parts();
@@ -293,20 +289,16 @@ async fn proxy_handler_wrapper(
                     .chain(BodyStream::new(full(suffix)));
                 let body = StreamBody::new(stream);
                 let response = Response::from_parts(parts, BodyExt::boxed(body));
-                log_response(&client_ip, &method, &path, &response);
+                log_response(&client_ip, &method, &path, &request_reason, &response);
                 Ok(response)
             } else {
                 let response = Response::from_parts(parts, body.boxed());
-                log_response(&client_ip, &method, &path, &response);
+                log_response(&client_ip, &method, &path, &request_reason, &response);
                 Ok(response)
             }
         }
         Err(error) => {
-            error!(
-                error = %error,
-                backtrace = ?error.backtrace,
-                "Proxy error occurred"
-            );
+            error!(error = %error, "Proxy error occurred");
             let status: StatusCode = error.to_string()[0..3]
                 .parse()
                 .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
@@ -314,28 +306,32 @@ async fn proxy_handler_wrapper(
                 .status(status)
                 .body(full(format!("S3-Proxy: {}\n", error)).boxed())
                 .unwrap();
-            log_response(&client_ip, &method, &path, &response);
+            log_response(&client_ip, &method, &path, &request_reason, &response);
             Ok(response)
         }
     }
 }
 
+lazy_static! {
+    static ref REQUEST_COUNTER: IntCounterVec = register_int_counter_vec!("s3proxy_requests_total", "Number of HTTP requests", &["method", "code", "service", "namespace", "job", "reason"]).unwrap();
+}
+
 #[tokio::main]
-pub async fn main() -> Result<(), ProxyError> {
+pub async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     // Initialize logging with logfmt format and env-filter
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
     Registry::default()
         .with(env_filter)
-        .with(tracing_logfmt::Builder::new()
-            .with_target(false)
-            .layer())
+        .with(tracing_logfmt::Builder::new().with_target(false).layer())
         .try_init()?;
 
-    let addr: SocketAddr = ([0, 0, 0, 0], 8080).into();
+    prometheus_exporter::start("0.0.0.0:8081".parse()?)?;
+    //let request_counter = register_counter_vec!("s3proxy_requests_total", "Number of HTTP requests", &["method", "code", "service", "namespace", "job", "instance"])?;
 
     info!(port = 8080, "Starting server");
 
+    let addr: SocketAddr = ([0, 0, 0, 0], 8080).into();
     let listener = TcpListener::bind(addr).await?;
     loop {
         let (tcp, addr) = listener.accept().await?;
@@ -344,16 +340,17 @@ pub async fn main() -> Result<(), ProxyError> {
         tokio::task::spawn(async move {
             if let Err(err) = http1::Builder::new()
                 .timer(TokioTimer::new())
-                .serve_connection(
-                    io,
-                    service_fn(move |req| proxy_handler_wrapper(req, addr)),
-                )
+                .serve_connection(io, service_fn(move |req| proxy_handler_wrapper(req, addr)))
                 .await
             {
-                error!(
-                    error = ?err,
-                    "Error serving connection"
-                );
+                // Ignore "Transport endpoint is not connected" errors caused by curl on connection shutdown
+                if let Some(io_err) = err.source().and_then(|e| e.downcast_ref::<std::io::Error>()) {
+                    if io_err.kind() == std::io::ErrorKind::NotConnected && io_err.raw_os_error() == Some(107) {
+                        return;
+                    }
+                }
+
+                error!(error = ?err, "Error serving connection");
             }
         });
     }
